@@ -24,35 +24,6 @@
  sudo apt install -y pixiewps
  ```
  
-***Other versions***
- ```
- sudo apt install -y build-essential unzip
- wget https://github.com/wiire-a/pixiewps/archive/master.zip && unzip master.zip
- cd pixiewps*/
- make
- sudo make install
- ```
-**Getting OneShot**
- ```
- cd ~
- wget https://raw.githubusercontent.com/drygdryg/OneShot/master/oneshot.py
- ```
-Optional: getting a list of vulnerable to pixie dust devices for highlighting in scan results:
- ```
- wget https://raw.githubusercontent.com/drygdryg/OneShot/master/vulnwsc.txt
- ```
-## Arch Linux
-**Installing requirements**
- ```
- sudo pacman -S wpa_supplicant pixiewps wget python
- ```
-**Installing requirements**  
-Adding the testing repository:
- ```
- sudo sh -c 'echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing/" >> /etc/apk/repositories'
- ```
- ```
- sudo apk add python3 wpa_supplicant pixiewps iw
  ```
 ## [Termux](https://termux.com/)
 Please note that root access is required.  
