@@ -54,14 +54,6 @@ Adding the testing repository:
  ```
  sudo apk add python3 wpa_supplicant pixiewps iw
  ```
- **Getting OneShot**
- ```
- sudo wget https://raw.githubusercontent.com/drygdryg/OneShot/master/oneshot.py
- ```
-Optional: getting a list of vulnerable to pixie dust devices for highlighting in scan results:
- ```
- sudo wget https://raw.githubusercontent.com/drygdryg/OneShot/master/vulnwsc.txt
- ```
 ## [Termux](https://termux.com/)
 Please note that root access is required.  
 
